@@ -5,6 +5,7 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbRequest
+import android.os.Build
 import android.util.Log
 import java.io.Closeable
 import java.nio.ByteBuffer
@@ -231,7 +232,7 @@ class NcmUsbBridge internal constructor(
                     readRequest = it
                 }
                 if (!readQueued) {
-                    directReadBuffer.clear()
+                    UsbTransferLimits.prepareRead(directReadBuffer, Build.VERSION.SDK_INT)
                     if (!current.queue(directReadBuffer)) throw failSession("Android could not queue the NCM read request")
                     readQueued = true
                 }

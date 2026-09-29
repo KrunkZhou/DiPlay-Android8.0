@@ -26,6 +26,8 @@ import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
@@ -87,7 +89,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Full-screen CarPlay host. It renders decoded video through a [TextureView], forwards touch to
+ * Full-screen CarPlay host. It renders decoded video through a [SurfaceView] on Android 8
+ * or a [TextureView] on newer releases, forwards touch to
  * the active AirPlay session, and drives the complete wired or wireless bring-up through
  * [CarPlayController].
  *
@@ -227,7 +230,7 @@ class CarPlayHostActivity : ComponentActivity() {
             }
         }
 
-    private var videoView: TextureView? = null
+    private var videoView: View? = null
     private var gestureOverlay: View? = null
     private var settingsMenu: View? = null
     private var mfiTargetGroup: RadioGroup? = null
@@ -356,18 +359,42 @@ class CarPlayHostActivity : ComponentActivity() {
 
         override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
             if (currentSurfaceTexture !== texture) return true
-            currentSurface?.let { surface ->
-                sink?.clearSurface(SCREEN_TYPE_MAIN, surface)
-                sink?.clearSurface(SCREEN_TYPE_ALT, surface)
-                surface.release()
-            }
-            currentSurface = null
-            currentSurfaceTexture = null
+            detachCurrentSurface()
             appendLog("Texture surface destroyed")
             return true
         }
 
         override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+    }
+
+    private val surfaceListener = object : SurfaceHolder.Callback {
+        override fun surfaceCreated(holder: SurfaceHolder) {
+            detachCurrentSurface()
+            currentSurface = holder.surface
+            attachSurface(holder.surface)
+            appendLog("Video output SurfaceView created")
+        }
+
+        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            scheduleDisplaySize(width, height)
+        }
+
+        override fun surfaceDestroyed(holder: SurfaceHolder) {
+            if (currentSurface !== holder.surface) return
+            detachCurrentSurface()
+            appendLog("Video output SurfaceView destroyed")
+        }
+    }
+
+    private fun detachCurrentSurface() {
+        currentSurface?.let { surface ->
+            sink?.clearSurface(SCREEN_TYPE_MAIN, surface)
+            sink?.clearSurface(SCREEN_TYPE_ALT, surface)
+            // TextureView wrappers belong to us; SurfaceHolder releases its own Surface.
+            if (currentSurfaceTexture != null) surface.release()
+        }
+        currentSurface = null
+        currentSurfaceTexture = null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -587,13 +614,7 @@ class CarPlayHostActivity : ComponentActivity() {
     override fun onDestroy() {
         mainHandler.removeCallbacks(applyDisplaySize)
         mainHandler.removeCallbacks(expireOldLogLines)
-        currentSurface?.let { surface ->
-            sink?.clearSurface(SCREEN_TYPE_MAIN, surface)
-            sink?.clearSurface(SCREEN_TYPE_ALT, surface)
-            surface.release()
-        }
-        currentSurface = null
-        currentSurfaceTexture = null
+        detachCurrentSurface()
         sessionLog?.append("Activity destroyed")
         sessionLog?.close()
         sessionLog = null
@@ -602,9 +623,14 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun buildContentView(): View {
         val root = FrameLayout(this).apply { setBackgroundColor(Color.rgb(12, 17, 27)) }
-        val video = TextureView(this).apply {
-            isOpaque = false
-            surfaceTextureListener = textureListener
+        val video = if (Build.VERSION.SDK_INT in 26..27) {
+            // A separate video surface avoids TextureView composition on Android 8 head units.
+            SurfaceView(this).apply { holder.addCallback(surfaceListener) }
+        } else {
+            TextureView(this).apply {
+                isOpaque = false
+                surfaceTextureListener = textureListener
+            }
         }
         val gestureLayer = View(this).apply {
             isClickable = true
@@ -1143,7 +1169,7 @@ class CarPlayHostActivity : ComponentActivity() {
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             content.addView(
-                settingsCategoryHeader("Android 9 compatibility"),
+                settingsCategoryHeader("Android 8–9 compatibility"),
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1151,8 +1177,8 @@ class CarPlayHostActivity : ComponentActivity() {
             )
             content.addView(
                 menuText(
-                    "The following settings are unavailable and hidden on Android 9 " +
-                        "(API 28):\n" +
+                    "The following settings are unavailable and hidden on Android 8–9 " +
+                        "(API 26–28):\n" +
                         "• Wi-Fi P2P (5 GHz) — LocalOnlyHotspot is used instead.\n" +
                         "• HEVC software decoder — hardware decoding is used instead.",
                     16f,

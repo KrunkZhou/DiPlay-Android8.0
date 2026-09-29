@@ -1,4 +1,6 @@
-# DiPlay
+# DiPlay for Android 8.0
+
+The APK supports Android 8.0 (API 26) or newer. Wireless uses Wi-Fi Direct on Android 10+, LocalOnlyHotspot on Android 8–9, or the car’s existing hotspot.
 
 **CarPlay for compatible Android head units.** Wired and wireless, with the familiar DiAuto interface. Independent app: `com.shihab.diplay`.
 

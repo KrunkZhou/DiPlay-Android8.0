@@ -13,6 +13,10 @@ internal class StreamReceiveStats(
     private var bytes = 0L
     private var maxReadNs = 0L
     private var maxProcessNs = 0L
+    private var totalReadNs = 0L
+    private var totalProcessNs = 0L
+    private var fastReads = 0
+    private var slowReads = 0
     private var nextSequence: Int? = null
     private var forwardGapPackets = 0
     private var lateOrDuplicate = 0
@@ -21,7 +25,11 @@ internal class StreamReceiveStats(
 
     fun received(size: Int, sequence: Int? = null) {
         processingStart = nowNs()
-        maxReadNs = maxOf(maxReadNs, processingStart - readStart)
+        val readNs = processingStart - readStart
+        maxReadNs = maxOf(maxReadNs, readNs)
+        totalReadNs += readNs
+        if (readNs < 1_000_000L) fastReads++
+        if (readNs > 25_000_000L) slowReads++
         packets++
         bytes += size
         if (sequence != null) {
@@ -35,7 +43,9 @@ internal class StreamReceiveStats(
     }
 
     fun processed() {
-        maxProcessNs = maxOf(maxProcessNs, nowNs() - processingStart)
+        val processNs = nowNs() - processingStart
+        maxProcessNs = maxOf(maxProcessNs, processNs)
+        totalProcessNs += processNs
         flush()
     }
 
@@ -44,12 +54,19 @@ internal class StreamReceiveStats(
         if (!ended && now - windowStart < 5_000_000_000L) return
         runCatching { report("Receive: $label packets=$packets bytes=$bytes readMaxMs=${maxReadNs / 1_000_000} " +
             "processMaxUs=${maxProcessNs / 1000} seqForwardGaps=$forwardGapPackets " +
-            "lateOrDuplicate=$lateOrDuplicate ended=$ended") }
+            "lateOrDuplicate=$lateOrDuplicate ended=$ended " +
+            "readAvgUs=${totalReadNs / maxOf(1, packets) / 1000} " +
+            "processAvgUs=${totalProcessNs / maxOf(1, packets) / 1000} " +
+            "readUnder1Ms=$fastReads readOver25Ms=$slowReads") }
         windowStart = now
         packets = 0
         bytes = 0
         maxReadNs = 0
         maxProcessNs = 0
+        totalReadNs = 0
+        totalProcessNs = 0
+        fastReads = 0
+        slowReads = 0
         forwardGapPackets = 0
         lateOrDuplicate = 0
     }

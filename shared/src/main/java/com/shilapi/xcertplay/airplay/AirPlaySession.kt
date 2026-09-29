@@ -134,7 +134,10 @@ class AirPlaySession(
             "Content-Type: $PLIST_CONTENT_TYPE\r\n" +
             "Content-Length: ${body.size}\r\n" +
             "CSeq: $eventCseq\r\n\r\n"
-        trace("airplay event tx headers=$head bodyHex=${body.toHex()}")
+        // HID reports arrive continuously during gestures; avoid formatting and logging every payload.
+        if (command["type"] != "hidSendReport") {
+            trace("airplay event tx headers=$head bodyHex=${body.toHex()}")
+        }
         return try {
             val bytes = cipher.encrypt(head.toByteArray(Charsets.US_ASCII) + body)
             val output = socket.getOutputStream()
@@ -605,6 +608,8 @@ class AirPlaySession(
     private fun acceptEvent(server: ServerSocket) {
         try {
             val socket = server.accept()
+            // Do not hold small HID commands while earlier TCP data awaits acknowledgement.
+            socket.tcpNoDelay = true
             socket.setSoLinger(true, 0)
             debugLog("airplay event connection accepted from ${socket.remoteSocketAddress}")
             eventSocket = socket

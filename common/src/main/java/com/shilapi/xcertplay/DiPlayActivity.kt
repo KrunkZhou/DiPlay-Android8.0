@@ -288,7 +288,8 @@ class DiPlayActivity : ComponentActivity() {
     // The runtime config rejects manual mode without valid credentials, so it is only saved together with them.
     private fun wirelessLinkControls(parent: LinearLayout) {
         val carHotspot = AirPlayPersistence.loadWirelessHotspotMode(this) == WirelessHotspotMode.MANUAL
-        val options = arrayOf("Wi-Fi Direct · default", "Car hotspot")
+        val defaultLink = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) "Wi-Fi Direct · default" else "Local hotspot · default"
+        val options = arrayOf(defaultLink, "Car hotspot")
         val control = button("Wireless link · ${options[if (carHotspot) 1 else 0]}", false) {}
         control.setOnClickListener {
             var selection = if (carHotspot) 1 else 0
@@ -308,7 +309,10 @@ class DiPlayActivity : ComponentActivity() {
         }
         parent.addView(control, matchButton(0, 60)); parent.addView(space(12))
         if (!carHotspot) {
-            parent.addView(label("DiPlay creates its own Wi-Fi Direct network for the iPhone.", 14, MUTED).apply {
+            val description = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                "DiPlay creates its own Wi-Fi Direct network for the iPhone."
+                else "DiPlay creates a local hotspot for the iPhone. Android chooses the Wi-Fi band."
+            parent.addView(label(description, 14, MUTED).apply {
                 setPadding(0, 0, 0, dp(18))
             })
             return
@@ -446,10 +450,14 @@ class DiPlayActivity : ComponentActivity() {
     }
 
     private fun wirelessHelp() {
+        val supportsWifiDirect = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+        val recoveryHelp = if (supportsWifiDirect)
+            "If a previous projection app left its connection running, reset CarPlay Wi-Fi below and connect again. Your car’s normal internet Wi-Fi stays on."
+            else "Reconnect below to restart the CarPlay connection using your saved wireless settings. If you use the car hotspot, keep it on."
         AlertDialog.Builder(this).setTitle("Wireless connection help")
-            .setMessage("Pair your iPhone with the car’s Bluetooth, keep Wi-Fi on, and allow CarPlay on the iPhone. Close any other phone-projection app.\n\nIf a previous projection app left its connection running, reset CarPlay Wi-Fi below and connect again. Your car’s normal internet Wi-Fi stays on.")
+            .setMessage("Pair your iPhone with the car’s Bluetooth, keep Wi-Fi on, and allow CarPlay on the iPhone. Close any other phone-projection app.\n\n$recoveryHelp")
             .setPositiveButton("Got it", null)
-            .setNeutralButton("Reset CarPlay Wi-Fi") { _, _ ->
+            .setNeutralButton(if (supportsWifiDirect) "Reset CarPlay Wi-Fi" else "Reconnect CarPlay Wi-Fi") { _, _ ->
                 confirmWirelessReset()
             }.show()
     }
@@ -461,14 +469,23 @@ class DiPlayActivity : ComponentActivity() {
     }
 
     private fun confirmWirelessReset() {
-        AlertDialog.Builder(this).setTitle("Reset CarPlay Wi-Fi?")
-            .setMessage("This ends the existing Wi-Fi Direct connection, including one left behind after reinstalling. Close other projection apps first. Your car’s internet Wi-Fi stays on.")
-            .setPositiveButton("Reset and connect") { _, _ ->
+        val supportsWifiDirect = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+        val message = if (supportsWifiDirect)
+            "This ends the existing Wi-Fi Direct connection, including one left behind after reinstalling. Close other projection apps first. Your car’s internet Wi-Fi stays on."
+            else "This restarts CarPlay using your saved wireless settings. DiPlay restarts its own hotspot when selected. If you use the car hotspot, keep it on."
+        AlertDialog.Builder(this).setTitle(if (supportsWifiDirect) "Reset CarPlay Wi-Fi?" else "Reconnect CarPlay Wi-Fi?")
+            .setMessage(message)
+            .setPositiveButton(if (supportsWifiDirect) "Reset and connect" else "Reconnect") { _, _ ->
                 CarPlayBackgroundSession.stop { runOnUiThread { resetWirelessGroup() } }
             }.setNegativeButton("Cancel", null).show()
     }
 
     private fun resetWirelessGroup() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            // Legacy Android uses our local hotspot or the user's existing hotspot, not Wi-Fi Direct.
+            connect(true)
+            return
+        }
         val manager = getSystemService(android.net.wifi.p2p.WifiP2pManager::class.java)
         if (manager == null) { toast("This head unit does not support Wi-Fi Direct."); return }
         val channel = manager.initialize(this, mainLooper, null)

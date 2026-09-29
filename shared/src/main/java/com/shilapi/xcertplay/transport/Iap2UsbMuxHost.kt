@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.transport
 
+import android.os.Build
 import android.util.Log
 import java.io.Closeable
 import java.util.ArrayDeque
@@ -25,6 +26,12 @@ class Iap2UsbMuxHost private constructor(
     private var nextSourcePort = FIRST_SOURCE_PORT
     private lateinit var readerThread: Thread
     private var receiveBuffer = ByteArray(0)
+    // Android 8 bulkTransfer truncates the whole USB write, including both protocol headers.
+    internal val maxTcpPayloadBytes = UsbTransferLimits.payloadSize(
+        preferredBytes = 16 * 1024,
+        headerBytes = MUX_HEADER_BYTES + TCP_HEADER_BYTES,
+        sdkInt = Build.VERSION.SDK_INT,
+    )
 
     private data class MuxFrame(
         val protocol: Int,
@@ -350,12 +357,12 @@ class Iap2UsbMuxTcpConnection internal constructor(
     private var closed = false
     private var failure: IphoneUsbException? = null
 
-    /** Sends [data] as an ordered byte stream, split into USBMUX TCP payloads of at most 16 KiB. */
+    /** Sends [data] as an ordered byte stream within the platform's complete USB frame limit. */
     override fun send(data: ByteArray) {
         synchronized(stateLock) { checkConnectedLocked() }
         var offset = 0
         while (offset < data.size) {
-            val count = minOf(MAX_SEND_PAYLOAD_BYTES, data.size - offset)
+            val count = minOf(host.maxTcpPayloadBytes, data.size - offset)
             val chunk = data.copyOfRange(offset, offset + count)
             synchronized(writeLock) {
                 val sequenceAndAck = synchronized(stateLock) {
@@ -552,7 +559,6 @@ class Iap2UsbMuxTcpConnection internal constructor(
         const val TCP_SYN = 0x02
         const val TCP_RST = 0x04
         const val TCP_ACK = 0x10
-        const val MAX_SEND_PAYLOAD_BYTES = 16 * 1024
         const val NANOS_PER_MILLISECOND = 1_000_000L
     }
 }

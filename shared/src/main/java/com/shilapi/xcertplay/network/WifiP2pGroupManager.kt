@@ -242,7 +242,7 @@ class WifiP2pGroupManager(
         if (removeGroup && activeChannel != null) {
             removeGroupBlocking(activeChannel)
         }
-        activeChannel?.close()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) activeChannel?.close()
         activeThread?.quitSafely()
     }
 
@@ -494,6 +494,7 @@ class WifiP2pGroupManager(
         Station(info?.supplicantState, info?.frequency?.takeIf { it > 0 })
     }.getOrDefault(Station(null, null))
 
+    @RequiresApi(Build.VERSION_CODES.Q)
     private fun checkPrerequisites(station: Station) {
         val wifi = appContext.getSystemService(WifiManager::class.java)
         val fiveGhzSupported = runCatching { wifi?.is5GHzBandSupported }.getOrNull()
@@ -595,7 +596,7 @@ class WifiP2pGroupManager(
         if (removeGroup && failedChannel != null) {
             removeGroupBlocking(failedChannel)
         }
-        failedChannel?.close()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) failedChannel?.close()
         failedThread?.quitSafely()
     }
 

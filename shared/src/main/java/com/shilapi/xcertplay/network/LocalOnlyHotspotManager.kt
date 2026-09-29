@@ -2,7 +2,6 @@ package com.shilapi.xcertplay.network
 
 import android.content.Context
 import android.net.ConnectivityManager
-import android.net.MacAddress
 import android.net.wifi.SoftApConfiguration
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
@@ -131,7 +130,7 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
         }
 
         releaseMulticastLock(activeMulticastLock)
-        activeReservation?.close()
+        closeReservation(activeReservation)
         activeCallbackThread?.quitSafely()
     }
 
@@ -140,7 +139,7 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
             override fun onStarted(
                 reservation: WifiManager.LocalOnlyHotspotReservation,
             ) {
-                val closeReservation = synchronized(stateLock) {
+                val shouldCloseReservation = synchronized(stateLock) {
                     if (
                         closed ||
                         startAttempt !== attempt ||
@@ -154,7 +153,7 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
                         false
                     }
                 }
-                if (closeReservation) reservation.close()
+                if (shouldCloseReservation) closeReservation(reservation)
             }
 
             override fun onFailed(reason: Int) {
@@ -265,13 +264,7 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
         val ssid = validateSsid(configuration.SSID)
         val security = mapWifiConfigurationSecurity(configuration)
         val passphrase = validatePassphrase(security, unquote(configuration.preSharedKey))
-        val bssid = configuration.BSSID?.let {
-            try {
-                MacAddress.fromString(it)
-            } catch (failure: IllegalArgumentException) {
-                throw IOException("LocalOnlyHotspot reported an invalid BSSID: $it", failure)
-            }
-        }
+        val bssid = configuration.BSSID?.let(::parseHotspotBssid)
         val channel = readWifiConfigurationChannel(configuration)
 
         return HotspotConfiguration(
@@ -279,8 +272,8 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
             passphrase = passphrase,
             security = security,
             channel = channel,
-            bssid = bssid?.toString(),
-            bssidBytes = bssid?.toByteArray(),
+            bssid = bssid?.toMacAddressString(),
+            bssidBytes = bssid,
             bandLabel = readWifiConfigurationBandLabel(configuration, channel),
         )
     }
@@ -462,8 +455,13 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
         Collections.list(inetAddresses).any { it is Inet6Address && it.isLinkLocalAddress }
 
     private fun NetworkInterface.hotspotAddress(): InetAddress? {
+        val addresses = Collections.list(inetAddresses)
+        // Android 8 firmware can expose an IPv6 address while CarPlay only connects over the AP's IPv4 path.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            addresses.firstOrNull { it is Inet4Address && !it.isLoopbackAddress }?.let { return it }
+        }
         var ipv4: InetAddress? = null
-        for (address in Collections.list(inetAddresses)) {
+        for (address in addresses) {
             if (address is Inet6Address && address.isLinkLocalAddress) {
                 if (address.scopeId == index) return address
                 try {
@@ -505,8 +503,13 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
             failedThread = attempt.thread
         }
         releaseMulticastLock(multicastLock)
-        failedReservation?.close()
+        closeReservation(failedReservation)
         failedThread?.quitSafely()
+    }
+
+    private fun closeReservation(reservation: WifiManager.LocalOnlyHotspotReservation?) {
+        if (reservation == null) return
+        retiredReservations.close(reservation, Build.VERSION.SDK_INT) { it.close() }
     }
 
     private fun waitNanos(nanos: Long) {
@@ -681,6 +684,9 @@ class LocalOnlyHotspotManager(context: Context) : WirelessHotspotManager {
     )
 
     private companion object {
+        // Reservations refer to the application-context WifiManager, never an Activity.
+        // Keep retired Android 8 reservations alive across manager recreation for this process.
+        val retiredReservations = HotspotReservationRetirement<WifiManager.LocalOnlyHotspotReservation>()
         const val MULTICAST_LOCK_TAG = "xcertplay-local-only-hotspot-mdns"
         const val NANOS_PER_MILLISECOND = 1_000_000L
         val INTERFACE_POLL_NANOS: Long = TimeUnit.MILLISECONDS.toNanos(100)

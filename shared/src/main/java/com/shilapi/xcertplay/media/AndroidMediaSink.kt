@@ -43,6 +43,8 @@ class AndroidMediaSink(
     private val screenStateLock = Any()
     private val activeScreenTypes = mutableSetOf<Int>()
     private val defaultSurface = surface
+    private val videoStateLock = Any()
+    private var videoClosed = false
     @Volatile private var screenStreamActiveChanged = onScreenStreamActiveChanged
     private val surfaces = ConcurrentHashMap<Int, Surface>()
     private val videoDecoders = ConcurrentHashMap<Int, VideoDecoder>()
@@ -76,12 +78,18 @@ class AndroidMediaSink(
     }
 
     fun setSurface(type: Int, surface: Surface) {
-        surfaces[type] = surface
-        videoDecoders[type]?.setSurface(surface)
+        synchronized(videoStateLock) {
+            if (videoClosed) return
+            surfaces[type] = surface
+            videoDecoders[type]?.setSurface(surface)
+        }
     }
 
+    /** Returns only after the decoder has stopped accessing the detached Surface. */
     fun clearSurface(type: Int, surface: Surface) {
-        if (surfaces.remove(type, surface)) videoDecoders[type]?.setSurface(null)
+        synchronized(videoStateLock) {
+            if (surfaces.remove(type, surface)) videoDecoders[type]?.setSurface(null)
+        }
     }
 
     fun setScreenStreamActiveChangedListener(listener: ((Int, Boolean) -> Unit)?) {
@@ -97,18 +105,18 @@ class AndroidMediaSink(
 
     override fun onVideoConfig(type: Int, codecData: ByteArray) {
         val codec = pendingVideoCodec[type] ?: VideoCodec.H264
-        videoDecoder(type).configure(codec, codecData)
+        videoDecoder(type)?.configure(codec, codecData)
     }
 
     override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
-        videoDecoder(type).submit(naluBytes)
+        videoDecoder(type)?.submit(naluBytes)
     }
 
     override fun onScreenStreamActive(type: Int, active: Boolean) {
         if (!active) {
             videoRecoveryHandlers.remove(type)
             videoDiagnosticHandlers.remove(type)
-            videoDecoders.remove(type)?.close()
+            synchronized(videoStateLock) { videoDecoders.remove(type)?.close() }
             pendingVideoCodec.remove(type)
         }
         synchronized(screenStateLock) {
@@ -144,8 +152,12 @@ class AndroidMediaSink(
             activeScreenTypes.clear()
             screenStreamActiveChanged = null
         }
-        videoDecoders.values.forEach(VideoDecoder::close)
-        videoDecoders.clear()
+        synchronized(videoStateLock) {
+            videoClosed = true
+            videoDecoders.values.forEach(VideoDecoder::close)
+            videoDecoders.clear()
+            surfaces.clear()
+        }
         videoRecoveryHandlers.clear()
         videoDiagnosticHandlers.clear()
         recoveryExecutor.shutdownNow()
@@ -155,7 +167,8 @@ class AndroidMediaSink(
         microphoneUplinks.clear()
     }
 
-    private fun videoDecoder(type: Int): VideoDecoder =
+    private fun videoDecoder(type: Int): VideoDecoder? = synchronized(videoStateLock) {
+        if (videoClosed) return@synchronized null
         videoDecoders.computeIfAbsent(type) {
             VideoDecoder(
                 surfaces[type] ?: defaultSurface,
@@ -163,9 +176,10 @@ class AndroidMediaSink(
                 videoHeight,
                 preferSoftwareHevcDecoder,
                 requestKeyFrame = { requestVideoRecovery(type) },
-                report = { videoDiagnosticHandlers[type]?.invoke(it) },
+                reportEvent = { videoDiagnosticHandlers[type]?.invoke(it) },
             )
         }
+    }
 
     @Synchronized
     private fun audioRenderer(type: Int, format: AudioFormat): AudioRenderer {
@@ -176,16 +190,19 @@ class AndroidMediaSink(
     }
 }
 
-/** Serial MediaCodec video decoder: one worker owns configure and frame feeding. */
+/** The worker feeds frames; surface changes and teardown serialize with it through codecLock. */
 private class VideoDecoder(
     surface: Surface?,
     private val width: Int,
     private val height: Int,
     private val preferSoftwareHevcDecoder: Boolean,
     private val requestKeyFrame: () -> Unit,
-    private val report: (String) -> Unit,
+    private val reportEvent: (String) -> Unit,
 ) : Closeable {
     private val queue = VideoDecodeQueue()
+    private val codecLock = Any()
+    private val pendingReports = java.util.ArrayDeque<String>()
+    private val inputBuffers = VideoInputBufferPolicy(Build.VERSION.SDK_INT)
     @Volatile private var running = true
     @Volatile private var decoder: MediaCodec? = null
     private var outputSurface: Surface? = surface
@@ -208,46 +225,74 @@ private class VideoDecoder(
     }
 
     fun setSurface(surface: Surface?) {
-        queue.offer(VideoJob.SurfaceChanged(surface))
+        synchronized(codecLock) {
+            if (!running) return
+            // Apply directly so an older queued attachment cannot revive a destroyed Surface.
+            changeSurface(surface)
+        }
     }
 
     override fun close() {
         running = false
         thread.interrupt()
+        synchronized(codecLock) {
+            outputSurface = null
+            releaseDecoder()
+        }
     }
 
     private fun run() {
         try {
             while (running) {
                 val job = queue.poll(5)
-                try {
-                    when (job) {
-                        is VideoJob.Config -> configureDecoder(job)
-                        is VideoJob.Frame -> {
-                            if (System.nanoTime() - job.receivedNs > MAX_FRAME_AGE_NS) {
-                                queue.discardFrames()
-                                recover("video backlog exceeded 250 ms")
-                            } else feed(job.nalus)
+                synchronized(codecLock) {
+                    if (!running) return
+                    try {
+                        when (job) {
+                            is VideoJob.Config -> configureDecoder(job)
+                            is VideoJob.Frame -> {
+                                if (System.nanoTime() - job.receivedNs > MAX_FRAME_AGE_NS) {
+                                    queue.discardFrames()
+                                    recover("video backlog exceeded 250 ms")
+                                } else feed(job.nalus)
+                            }
+                            is VideoJob.SurfaceChanged -> changeSurface(job.surface)
+                            is VideoJob.Resync -> recover("video queue overflow")
+                            null -> Unit
                         }
-                        is VideoJob.SurfaceChanged -> changeSurface(job.surface)
-                        is VideoJob.Resync -> recover("video queue overflow")
-                        null -> Unit
+                        decoder?.let(::drainOutput)
+                        stats.logIfDue()?.let(::report)
+                        if (running && referenceChain.needsKeyFrame && lastConfig != null && outputSurface != null) requestKeyFrameIfDue()
+                    } catch (error: Exception) {
+                        if (running) Log.e(TAG, "video decoder job failed: ${job?.javaClass?.simpleName}", error)
+                        if (running) report("decoder error ${error.javaClass.simpleName}; waiting for keyframe")
+                        releaseDecoder()
+                        referenceChain.reset()
+                        if (running) requestKeyFrameIfDue()
                     }
-                    decoder?.let(::drainOutput)
-                    stats.logIfDue()?.let(report)
-                    if (referenceChain.needsKeyFrame && lastConfig != null && outputSurface != null) requestKeyFrameIfDue()
-                } catch (error: Exception) {
-                    if (running) Log.e(TAG, "video decoder job failed: ${job?.javaClass?.simpleName}", error)
-                    if (running) report("decoder error ${error.javaClass.simpleName}; waiting for keyframe")
-                    releaseDecoder()
-                    referenceChain.reset()
-                    requestKeyFrameIfDue()
                 }
+                drainReports()
             }
         } catch (_: InterruptedException) {
             // Worker shut down.
         } finally {
-            releaseDecoder()
+            synchronized(codecLock) { releaseDecoder() }
+            drainReports()
+        }
+    }
+
+    private fun report(message: String) {
+        pendingReports.addLast(message)
+    }
+
+    private fun drainReports() {
+        val messages = synchronized(codecLock) {
+            pendingReports.toList().also { pendingReports.clear() }
+        }
+        // Diagnostics can call back into session/hotspot state; never invoke them under codecLock.
+        messages.forEach { message ->
+            try { reportEvent(message) }
+            catch (error: RuntimeException) { Log.w(TAG, "Video diagnostic callback failed", error) }
         }
     }
 
@@ -274,7 +319,7 @@ private class VideoDecoder(
         val mime = if (codec == VideoCodec.H265) MediaFormat.MIMETYPE_VIDEO_HEVC
         else MediaFormat.MIMETYPE_VIDEO_AVC
         val format = MediaFormat.createVideoFormat(mime, width, height).apply {
-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE)
+            inputBuffers.requestedSizeBytes?.let { setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, it) }
             setInteger(MediaFormat.KEY_PRIORITY, 0)
         }
         if (codec == VideoCodec.H265) {
@@ -381,12 +426,18 @@ private class VideoDecoder(
         if (index < 0) { recover("video decoder input stalled"); return }
         val input = checkNotNull(codec.getInputBuffer(index)) { "Decoder input buffer unavailable" }
         input.clear()
-        if (annexB.size <= input.remaining()) {
+        val capacityBytes = input.remaining()
+        if (annexB.size <= capacityBytes) {
             input.put(annexB)
             codec.queueInputBuffer(index, 0, annexB.size, System.nanoTime() / 1000, 0)
             referenceChain.onQueued()
         } else {
-            recover("video frame exceeded codec input capacity")
+            val grew = inputBuffers.growFor(annexB.size, capacityBytes)
+            // Recovery releases the acquired buffer and waits for a new complete keyframe.
+            recover(
+                "video frame exceeded codec input capacity frame=${annexB.size} capacity=$capacityBytes" +
+                    if (grew) "; increasing input buffer request to ${inputBuffers.requestedSizeBytes}" else "",
+            )
             return
         }
         drainOutput(codec)
@@ -452,7 +503,6 @@ private class VideoDecoder(
         )
     }
 
-    @Synchronized
     private fun releaseDecoder() {
         val codec = decoder
         decoder = null
@@ -472,7 +522,6 @@ private class VideoDecoder(
 
     private companion object {
         const val TAG = "xcertplay-usb"
-        const val MAX_INPUT_SIZE = 8 * 1024 * 1024
         const val INPUT_TIMEOUT_US = 10_000L
         const val MAX_FRAME_AGE_NS = 250_000_000L
         val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
